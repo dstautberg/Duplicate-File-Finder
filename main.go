@@ -35,8 +35,8 @@ func listDrives() []string {
 }
 
 // walkFiles walks through all files and directories under the given root path and saves each path to the database.
-func walkFiles(root string, db *sql.DB, progress chan<- int) (int, error) {
-	stmt, err := db.Prepare("INSERT INTO files(path) VALUES(?)")
+func walkFiles(root string, db *sql.DB, progress chan<- int, computerName, diskLabel string) (int, error) {
+	stmt, err := db.Prepare("INSERT INTO files(path, computer, disk_label) VALUES(?, ?, ?)")
 	if err != nil {
 		return 0, fmt.Errorf("prepare insert: %w", err)
 	}
@@ -47,7 +47,7 @@ func walkFiles(root string, db *sql.DB, progress chan<- int) (int, error) {
 		if err != nil {
 			return nil
 		}
-		_, err = stmt.Exec(path)
+		_, err = stmt.Exec(path, computerName, diskLabel)
 		if err == nil {
 			count++
 			if progress != nil {
@@ -56,9 +56,7 @@ func walkFiles(root string, db *sql.DB, progress chan<- int) (int, error) {
 		}
 		return nil
 	})
-	if progress != nil {
-		close(progress)
-	}
+	// Removed: if progress != nil { close(progress) }
 	return count, err
 }
 
@@ -67,7 +65,12 @@ func setupDatabase(dbPath string) (*sql.DB, error) {
 	if err != nil {
 		return nil, err
 	}
-	_, err = db.Exec(`CREATE TABLE IF NOT EXISTS files (id INTEGER PRIMARY KEY, path TEXT NOT NULL)`)
+	_, err = db.Exec(`CREATE TABLE IF NOT EXISTS files (
+		id INTEGER PRIMARY KEY,
+		path TEXT NOT NULL,
+		computer TEXT,
+		disk_label TEXT
+	)`)
 	if err != nil {
 		db.Close()
 		return nil, err
@@ -140,6 +143,40 @@ func getDiskUsage(path string) (total, free, used uint64, err error) {
 	return
 }
 
+// getDiskLabel returns the volume label for a given drive root (e.g., "C:\") on Windows
+func getDiskLabel(drive string) string {
+	var volumeName [256]uint16
+	var fsName [256]uint16
+	var serialNumber, maxComponentLen, fileSysFlags uint32
+	driveRoot := drive[0:3] // e.g., "C:\
+	kernel32 := syscall.NewLazyDLL("kernel32.dll")
+	getVolumeInformationW := kernel32.NewProc("GetVolumeInformationW")
+	ptr, _ := syscall.UTF16PtrFromString(driveRoot)
+	ret, _, _ := getVolumeInformationW.Call(
+		uintptr(unsafe.Pointer(ptr)),
+		uintptr(unsafe.Pointer(&volumeName[0])),
+		uintptr(len(volumeName)),
+		uintptr(unsafe.Pointer(&serialNumber)),
+		uintptr(unsafe.Pointer(&maxComponentLen)),
+		uintptr(unsafe.Pointer(&fileSysFlags)),
+		uintptr(unsafe.Pointer(&fsName[0])),
+		uintptr(len(fsName)),
+	)
+	if ret != 0 {
+		return syscall.UTF16ToString(volumeName[:])
+	}
+	return ""
+}
+
+// getComputerName returns the computer's hostname or "Unknown" if it cannot be determined
+func getComputerName() string {
+	name, err := os.Hostname()
+	if err != nil {
+		return "Unknown"
+	}
+	return name
+}
+
 func main() {
 	db, err := setupDatabase("files.db")
 	if err != nil {
@@ -156,63 +193,53 @@ func main() {
 		}
 	}
 
-	var fileCount int
+	var totalFiles int
 	if len(drives) > 0 {
-		total, free, used, err := getDiskUsage(drives[0])
-		if err != nil {
-			fmt.Printf("Error getting disk usage for %s: %v\n", drives[0], err)
-		} else {
-			fmt.Printf("Disk usage for %s: Total: %.2f GB, Used: %.2f GB, Free: %.2f GB\n", drives[0], float64(total)/1e9, float64(used)/1e9, float64(free)/1e9)
-		}
-		// Get disk label (volume name) using Windows API
-		var volumeName [256]uint16
-		var fsName [256]uint16
-		var serialNumber, maxComponentLen, fileSysFlags uint32
-		driveRoot := drives[0][0:3] // e.g., "C:\\"
-		kernel32 := syscall.NewLazyDLL("kernel32.dll")
-		getVolumeInformationW := kernel32.NewProc("GetVolumeInformationW")
-		ptr, _ := syscall.UTF16PtrFromString(driveRoot)
-		ret, _, _ := getVolumeInformationW.Call(
-			uintptr(unsafe.Pointer(ptr)),
-			uintptr(unsafe.Pointer(&volumeName[0])),
-			uintptr(len(volumeName)),
-			uintptr(unsafe.Pointer(&serialNumber)),
-			uintptr(unsafe.Pointer(&maxComponentLen)),
-			uintptr(unsafe.Pointer(&fileSysFlags)),
-			uintptr(unsafe.Pointer(&fsName[0])),
-			uintptr(len(fsName)),
-		)
-		label := ""
-		if ret != 0 {
-			label = syscall.UTF16ToString(volumeName[:])
-		}
-		fmt.Printf("\nWalking files in %s (%s, label: %s):\n", drives[0], drives[0][0:2], label)
-		done := make(chan struct{})
-		progress := make(chan int)
-		var lastCount int
-		// Start a goroutine to print files processed every second
-		go func() {
-			ticker := time.NewTicker(1 * time.Second)
-			defer ticker.Stop()
-			p := message.NewPrinter(message.MatchLanguage("en"))
-			for {
-				select {
-				case <-done:
-					return
-				case c := <-progress:
-					lastCount = c
-				case <-ticker.C:
-					p.Printf("Files processed: %d\r", lastCount)
-				}
+		for _, drive := range drives {
+			total, free, used, err := getDiskUsage(drive)
+			if err != nil {
+				fmt.Printf("Error getting disk usage for %s: %v\n", drive, err)
+			} else {
+				fmt.Printf("Disk usage for %s: Total: %.2f GB, Used: %.2f GB, Free: %.2f GB\n", drive, float64(total)/1e9, float64(used)/1e9, float64(free)/1e9)
 			}
-		}()
-		fileCount, err = walkFiles(drives[0], db, progress)
-		close(done) // Stop monitoring goroutine
-		fmt.Println() // Newline after progress
-		if err != nil {
-			fmt.Printf("Finished walking with error: %v\n", err)
-		} else {
-			message.NewPrinter(message.MatchLanguage("en")).Printf("Finished walking files without critical errors. Files processed: %d\n", fileCount)
+			// Get disk label (volume name) using Windows API
+			label := getDiskLabel(drive)
+			// Get computer name
+			computerName := getComputerName()
+			fmt.Printf("Walking files: %s, %s, %s\n", computerName, label, drive[0:2])
+			done := make(chan struct{})
+			progress := make(chan int)
+			var lastCount int
+			// Start a goroutine to print files processed every second
+			go func() {
+				ticker := time.NewTicker(1 * time.Second)
+				defer ticker.Stop()
+				p := message.NewPrinter(message.MatchLanguage("en"))
+				for {
+					select {
+					case <-done:
+						return
+					case c, ok := <-progress:
+						if !ok {
+							return
+						}
+						lastCount = c
+					case <-ticker.C:
+						p.Printf("Files processed: %d\r", lastCount)
+					}
+				}
+			}()
+			fileCount, err := walkFiles(drive, db, progress, computerName, label)
+			close(progress) // Close progress channel after walkFiles returns
+			close(done)     // Stop monitoring goroutine
+			fmt.Println()   // Newline after progress
+			if err != nil {
+				fmt.Printf("Finished walking with error: %v\n", err)
+			} else {
+				message.NewPrinter(message.MatchLanguage("en")).Printf("Finished walking files without critical errors. Files processed: %d\n", fileCount)
+			}
+			totalFiles += fileCount
 		}
+		message.NewPrinter(message.MatchLanguage("en")).Printf("\nAll drives processed. Total files processed: %d\n", totalFiles)
 	}
 }
