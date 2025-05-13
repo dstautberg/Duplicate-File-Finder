@@ -2,6 +2,7 @@ package main
 
 import (
 	"database/sql"
+	"encoding/csv"
 	"flag"
 	"fmt"
 	"os"
@@ -184,10 +185,76 @@ func getCPUUsageWMI() string {
 	return fmt.Sprintf("CPU Usage: %d%%", dst[0].PercentProcessorTime)
 }
 
+func exportFilesTableToCSV(dbPath, csvPath string) error {
+	db, err := sql.Open("sqlite", dbPath)
+	if err != nil {
+		return fmt.Errorf("failed to open database: %v", err)
+	}
+	defer db.Close()
+
+	rows, err := db.Query("SELECT id, path, computer, disk_label, size FROM files")
+	if err != nil {
+		return fmt.Errorf("failed to query files table: %v", err)
+	}
+	defer rows.Close()
+
+	file, err := os.Create(csvPath)
+	if err != nil {
+		return fmt.Errorf("failed to create CSV file: %v", err)
+	}
+	defer file.Close()
+
+	w := csv.NewWriter(file)
+	defer w.Flush()
+
+	// Write header
+	err = w.Write([]string{"id", "path", "computer", "disk_label", "size"})
+	if err != nil {
+		return fmt.Errorf("failed to write CSV header: %v", err)
+	}
+
+	for rows.Next() {
+		var id int
+		var path, computer, diskLabel string
+		var size int64
+		if err := rows.Scan(&id, &path, &computer, &diskLabel, &size); err != nil {
+			return fmt.Errorf("failed to scan row: %v", err)
+		}
+		record := []string{
+			fmt.Sprintf("%d", id),
+			path,
+			computer,
+			diskLabel,
+			fmt.Sprintf("%d", size),
+		}
+		if err := w.Write(record); err != nil {
+			return fmt.Errorf("failed to write CSV record: %v", err)
+		}
+	}
+	if err := rows.Err(); err != nil {
+		return fmt.Errorf("row iteration error: %v", err)
+	}
+	return nil
+}
+
 func main() {
 	deleteFlag := flag.Bool("delete-all", false, "Delete all data in the database before scanning.")
 	driveFlag := flag.String("drive", "", "Scan only the specified drive letter (e.g. C, D, E).")
+	reportFlag := flag.Bool("report", false, "Export the files table to files.csv and exit.")
 	flag.Parse()
+
+	if *reportFlag {
+		dbPath := "files.db"
+		csvPath := "files.csv"
+		fmt.Printf("Exporting files table from %s to %s...\n", dbPath, csvPath)
+		err := exportFilesTableToCSV(dbPath, csvPath)
+		if err != nil {
+			fmt.Printf("[ERROR] Export failed: %v\n", err)
+			os.Exit(1)
+		}
+		fmt.Printf("Export successful. CSV saved to %s\n", csvPath)
+		return
+	}
 
 	db, err := setupDatabase("files.db")
 	if err != nil {
