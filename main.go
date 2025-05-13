@@ -164,7 +164,29 @@ func main() {
 		} else {
 			fmt.Printf("Disk usage for %s: Total: %.2f GB, Used: %.2f GB, Free: %.2f GB\n", drives[0], float64(total)/1e9, float64(used)/1e9, float64(free)/1e9)
 		}
-		fmt.Printf("\nWalking files in %s:\n", drives[0])
+		// Get disk label (volume name) using Windows API
+		var volumeName [256]uint16
+		var fsName [256]uint16
+		var serialNumber, maxComponentLen, fileSysFlags uint32
+		driveRoot := drives[0][0:3] // e.g., "C:\\"
+		kernel32 := syscall.NewLazyDLL("kernel32.dll")
+		getVolumeInformationW := kernel32.NewProc("GetVolumeInformationW")
+		ptr, _ := syscall.UTF16PtrFromString(driveRoot)
+		ret, _, _ := getVolumeInformationW.Call(
+			uintptr(unsafe.Pointer(ptr)),
+			uintptr(unsafe.Pointer(&volumeName[0])),
+			uintptr(len(volumeName)),
+			uintptr(unsafe.Pointer(&serialNumber)),
+			uintptr(unsafe.Pointer(&maxComponentLen)),
+			uintptr(unsafe.Pointer(&fileSysFlags)),
+			uintptr(unsafe.Pointer(&fsName[0])),
+			uintptr(len(fsName)),
+		)
+		label := ""
+		if ret != 0 {
+			label = syscall.UTF16ToString(volumeName[:])
+		}
+		fmt.Printf("\nWalking files in %s (%s, label: %s):\n", drives[0], drives[0][0:2], label)
 		done := make(chan struct{})
 		progress := make(chan int)
 		var lastCount int
