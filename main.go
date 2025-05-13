@@ -51,7 +51,8 @@ func setupDatabase(dbPath string) (*sql.DB, error) {
 			path TEXT NOT NULL,
 			computer TEXT,
 			disk_label TEXT,
-			size INTEGER
+			size INTEGER,
+			UNIQUE(path, computer, disk_label)
 		)`)
 		if err != nil {
 			db.Close()
@@ -63,7 +64,8 @@ func setupDatabase(dbPath string) (*sql.DB, error) {
 			path TEXT NOT NULL,
 			computer TEXT,
 			disk_label TEXT,
-			size INTEGER
+			size INTEGER,
+			UNIQUE(path, computer, disk_label)
 		)`)
 		if err != nil {
 			db.Close()
@@ -74,7 +76,8 @@ func setupDatabase(dbPath string) (*sql.DB, error) {
 }
 
 func walkFiles(root string, db *sql.DB, progress chan<- int, computerName, diskLabel string) (int, error) {
-	stmt, err := db.Prepare("INSERT INTO files(path, computer, disk_label, size) VALUES(?, ?, ?, ?)")
+	stmt, err := db.Prepare(`INSERT INTO files(path, computer, disk_label, size) VALUES(?, ?, ?, ?)
+	ON CONFLICT(path, computer, disk_label) DO UPDATE SET size=excluded.size`)
 	if err != nil {
 		return 0, err
 	}
@@ -98,7 +101,7 @@ func walkFiles(root string, db *sql.DB, progress chan<- int, computerName, diskL
 				progress <- count
 			}
 		} else {
-			fmt.Printf("[ERROR] Failed to insert %s: %v\n", path, err)
+			fmt.Printf("[ERROR] Failed to insert or update %s: %v\n", path, err)
 		}
 		return nil
 	})
@@ -182,6 +185,7 @@ func getCPUUsageWMI() string {
 }
 
 func main() {
+	deleteFlag := flag.Bool("delete-all", false, "Delete all data in the database before scanning.")
 	driveFlag := flag.String("drive", "", "Scan only the specified drive letter (e.g. C, D, E).")
 	flag.Parse()
 
@@ -191,6 +195,15 @@ func main() {
 		return
 	}
 	defer db.Close()
+
+	if *deleteFlag {
+		_, err := db.Exec("DELETE FROM files")
+		if err != nil {
+			fmt.Printf("Failed to delete all data from database: %v\n", err)
+			return
+		}
+		fmt.Println("All data deleted from the database.")
+	}
 
 	drives := listDrives()
 	fmt.Print("Available drives: ")
