@@ -2,6 +2,7 @@ package main
 
 import (
 	"database/sql"
+	"flag"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -181,6 +182,9 @@ func getCPUUsageWMI() string {
 }
 
 func main() {
+	driveFlag := flag.String("drive", "", "Scan only the specified drive letter (e.g. C, D, E).")
+	flag.Parse()
+
 	db, err := setupDatabase("files.db")
 	if err != nil {
 		fmt.Printf("Failed to open database: %v\n", err)
@@ -196,8 +200,38 @@ func main() {
 		fmt.Println("(none found)")
 	}
 
+	var drivesToScan []string
+	if *driveFlag != "" {
+		found := false
+		driveInput := strings.ToLower(strings.TrimSpace(*driveFlag))
+		if len(driveInput) > 0 {
+			driveInputLetter := driveInput[:1]
+			for _, d := range drives {
+				driveLetter := strings.ToLower(d[:1])
+				if driveLetter == driveInputLetter {
+					found = true
+					break
+				}
+			}
+		}
+		if !found {
+			fmt.Printf("Drive %s not found or not available.\n", *driveFlag)
+			return
+		}
+		// Use the canonical drive name from the available drives list for scanning
+		for _, d := range drives {
+			driveLetter := strings.ToLower(d[:1])
+			if driveLetter == driveInput[:1] {
+				drivesToScan = []string{d}
+				break
+			}
+		}
+	} else {
+		drivesToScan = drives
+	}
+
 	var totalFiles int
-	for _, drive := range drives {
+	for _, drive := range drivesToScan {
 		total, free, used, err := getDiskUsage(drive)
 		if err != nil {
 			fmt.Printf("Error getting disk usage for %s: %v\n", drive, err)
