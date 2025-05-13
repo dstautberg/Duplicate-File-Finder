@@ -10,6 +10,8 @@ import (
 	"time"
 	"unsafe"
 
+	"strings"
+
 	"github.com/StackExchange/wmi"
 	"golang.org/x/text/message"
 	_ "modernc.org/sqlite"
@@ -36,7 +38,7 @@ func listDrives() []string {
 
 // walkFiles walks through all files and directories under the given root path and saves each path to the database.
 func walkFiles(root string, db *sql.DB, progress chan<- int, computerName, diskLabel string) (int, error) {
-	stmt, err := db.Prepare("INSERT INTO files(path, computer, disk_label) VALUES(?, ?, ?)")
+	stmt, err := db.Prepare("INSERT INTO files(path, computer, disk_label, size) VALUES(?, ?, ?, ?)")
 	if err != nil {
 		return 0, fmt.Errorf("prepare insert: %w", err)
 	}
@@ -47,33 +49,68 @@ func walkFiles(root string, db *sql.DB, progress chan<- int, computerName, diskL
 		if err != nil {
 			return nil
 		}
-		_, err = stmt.Exec(path, computerName, diskLabel)
+		var size int64 = 0
+		if !d.IsDir() {
+			info, statErr := d.Info()
+			if statErr == nil {
+				size = info.Size()
+			}
+		}
+		_, err = stmt.Exec(path, computerName, diskLabel, size)
 		if err == nil {
 			count++
 			if progress != nil {
 				progress <- count
 			}
+		} else {
+			fmt.Printf("[ERROR] Failed to insert %s: %v\n", path, err)
 		}
 		return nil
 	})
-	// Removed: if progress != nil { close(progress) }
+	if progress != nil {
+		progress <- count // send final count
+	}
 	return count, err
 }
 
 func setupDatabase(dbPath string) (*sql.DB, error) {
+	// Check if the database file exists
+	fileExists := false
+	if _, err := os.Stat(dbPath); err == nil {
+		fileExists = true
+	}
+
 	db, err := sql.Open("sqlite", dbPath)
 	if err != nil {
 		return nil, err
 	}
-	_, err = db.Exec(`CREATE TABLE IF NOT EXISTS files (
-		id INTEGER PRIMARY KEY,
-		path TEXT NOT NULL,
-		computer TEXT,
-		disk_label TEXT
-	)`)
-	if err != nil {
-		db.Close()
-		return nil, err
+
+	if !fileExists {
+		// Only create the table if the DB did not exist
+		_, err = db.Exec(`CREATE TABLE files (
+			id INTEGER PRIMARY KEY,
+			path TEXT NOT NULL,
+			computer TEXT,
+			disk_label TEXT,
+			size INTEGER
+		)`)
+		if err != nil {
+			db.Close()
+			return nil, err
+		}
+	} else {
+		// Ensure the table exists (but do not drop or recreate)
+		_, err = db.Exec(`CREATE TABLE IF NOT EXISTS files (
+			id INTEGER PRIMARY KEY,
+			path TEXT NOT NULL,
+			computer TEXT,
+			disk_label TEXT,
+			size INTEGER
+		)`)
+		if err != nil {
+			db.Close()
+			return nil, err
+		}
 	}
 	return db, nil
 }
@@ -187,9 +224,11 @@ func main() {
 
 	drives := listDrives()
 	if drives != nil {
-		fmt.Println("Available drives:")
-		for _, drive := range drives {
-			fmt.Println(drive)
+		fmt.Print("Available drives: ")
+		if len(drives) > 0 {
+			fmt.Println(strings.Join(drives, ", "))
+		} else {
+			fmt.Println("(none found)")
 		}
 	}
 
@@ -202,13 +241,11 @@ func main() {
 			} else {
 				fmt.Printf("Disk usage for %s: Total: %.2f GB, Used: %.2f GB, Free: %.2f GB\n", drive, float64(total)/1e9, float64(used)/1e9, float64(free)/1e9)
 			}
-			// Get disk label (volume name) using Windows API
 			label := getDiskLabel(drive)
-			// Get computer name
 			computerName := getComputerName()
-			fmt.Printf("Walking files: %s, %s, %s\n", computerName, label, drive[0:2])
+			fmt.Printf("Walking files: %s, %s, %s\n", computerName, label, drive)
 			done := make(chan struct{})
-			progress := make(chan int)
+			progress := make(chan int, 100)
 			var lastCount int
 			// Start a goroutine to print files processed every second
 			go func() {
@@ -221,18 +258,28 @@ func main() {
 						return
 					case c, ok := <-progress:
 						if !ok {
+							// Channel closed, print final count
+							cpu := getCPUUsageWMI()
+							p.Printf("Channel closed. Files processed: %d | %s\n", lastCount, cpu)
 							return
 						}
 						lastCount = c
 					case <-ticker.C:
-						p.Printf("Files processed: %d\r", lastCount)
+						cpu := getCPUUsageWMI()
+						p.Printf("Files processed: %d | %s\r", lastCount, cpu)
 					}
 				}
 			}()
+
 			fileCount, err := walkFiles(drive, db, progress, computerName, label)
-			close(progress) // Close progress channel after walkFiles returns
-			close(done)     // Stop monitoring goroutine
-			fmt.Println()   // Newline after progress
+			if err != nil {
+				fmt.Printf("[ERROR] Error walking files for drive %s: %v\n", drive, err)
+			}
+			close(progress)                    // Close progress channel after walkFiles returns
+			close(done)                        // Stop monitoring goroutine
+			time.Sleep(500 * time.Millisecond) // Give goroutine time to print final output
+			fmt.Println()                      // Newline after progress
+
 			if err != nil {
 				fmt.Printf("Finished walking with error: %v\n", err)
 			} else {
